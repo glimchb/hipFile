@@ -200,14 +200,12 @@ def _setup_functions(lib: ctypes.CDLL) -> None:
     ]
 
     # Batch API
-    # hipFileBatchIOSetUpRead / hipFileBatchIOSetUpWrite take the same signature
-    for fn_name in ("hipFileBatchIOSetUpRead", "hipFileBatchIOSetUpWrite"):
-        fn = getattr(lib, fn_name)
-        fn.restype  = hipFileStatus_t
-        fn.argtypes = [
-            ctypes.POINTER(hipFileBatchHandle_t),
-            ctypes.c_int,  # max_num_events
-        ]
+    # hipFileBatchIOSetUp is the unified function for both read and write
+    lib.hipFileBatchIOSetUp.restype  = hipFileStatus_t
+    lib.hipFileBatchIOSetUp.argtypes = [
+        ctypes.POINTER(hipFileBatchHandle_t),
+        ctypes.c_uint,  # max_nr
+    ]
 
     lib.hipFileBatchIOSubmit.restype  = hipFileStatus_t
     lib.hipFileBatchIOSubmit.argtypes = [

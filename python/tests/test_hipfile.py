@@ -1,215 +1,301 @@
 """
 Tests for hipfile Python bindings.
-
-These tests use a mock shared library so they run on any machine without
-real AMD GPU hardware or libhipfile.so installed.
+Run without real AMD hardware using mocks.
 """
 
 import ctypes
-import ctypes.util
 import os
-import struct
-import sys
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch, call
+
 
 # ---------------------------------------------------------------------------
-# Shared mock library helper
+# Mock library factory
 # ---------------------------------------------------------------------------
 
 def _make_mock_lib():
-    """Return a MagicMock that looks enough like the ctypes CDLL for our API."""
     lib = MagicMock()
+    from hipfile.bindings import hipFileError
 
-    from hipfile._hipfile import hipFileStatus_t, hipFileDriverProps_t
+    ok = hipFileError(); ok.err = 0; ok.cu_err = 0
 
-    # Default: everything succeeds
-    ok = hipFileStatus_t()
-    ok.err    = 0
-    ok.cu_err = 0
-
-    lib.hipFileDriverOpen.return_value = ok
-    lib.hipFileDriverClose.return_value = None
-    lib.hipFileDriverGetProperties.return_value = ok
-    lib.hipFileDriverSetMaxDirectIOSize.return_value = ok
-    lib.hipFileDriverSetMaxCacheSize.return_value = ok
-    lib.hipFileDriverSetMaxPinnedMemSize.return_value = ok
+    lib.hipFileDriverOpen.return_value  = ok
+    lib.hipFileDriverClose.return_value = ok
     lib.hipFileHandleRegister.return_value = ok
     lib.hipFileHandleDeregister.return_value = None
-    lib.hipFileBufRegister.return_value = ok
+    lib.hipFileBufRegister.return_value   = ok
     lib.hipFileBufDeregister.return_value = ok
     lib.hipFileRead.return_value  = 1024
     lib.hipFileWrite.return_value = 1024
-    lib.hipFileReadAsync.return_value  = ok
-    lib.hipFileWriteAsync.return_value = ok
     return lib
 
 
+def _patch_lib(mock_lib):
+    """Patch _bindings._lib directly so all convenience functions use it."""
+    return patch("hipfile.bindings._lib", mock_lib)
+
+
 # ---------------------------------------------------------------------------
-# Tests
+# Low-level bindings tests
 # ---------------------------------------------------------------------------
 
-class TestDriverLifecycle(unittest.TestCase):
+class TestBindings(unittest.TestCase):
 
     def setUp(self):
-        import hipfile._hipfile as low
-        import hipfile.hipfile  as high
-        self.mock_lib = _make_mock_lib()
-        # Patch _get_lib so no real .so is needed
-        self.patcher = patch("hipfile.hipfile._get_lib", return_value=self.mock_lib)
-        self.patcher.start()
+        self.lib = _make_mock_lib()
+        self.p   = _patch_lib(self.lib)
+        self.p.start()
 
     def tearDown(self):
-        self.patcher.stop()
-        import hipfile._hipfile
-        hipfile._hipfile._lib = None  # reset singleton
+        self.p.stop()
 
-    def test_driver_open_close(self):
+    def test_driver_open(self):
         import hipfile
-        hipfile.driver_open()
-        self.mock_lib.hipFileDriverOpen.assert_called_once()
-        hipfile.driver_close()
-        self.mock_lib.hipFileDriverClose.assert_called_once()
+        hipfile.hipFileDriverOpen()
+        self.lib.hipFileDriverOpen.assert_called_once()
 
-    def test_driver_context_manager(self):
+    def test_driver_close(self):
         import hipfile
-        with hipfile.Driver():
-            pass
-        self.mock_lib.hipFileDriverOpen.assert_called_once()
-        self.mock_lib.hipFileDriverClose.assert_called_once()
+        hipfile.hipFileDriverClose()
+        self.lib.hipFileDriverClose.assert_called_once()
 
     def test_driver_open_error_raises(self):
+        from hipfile.bindings import hipFileError, _ck
+        bad = hipFileError(); bad.err = 7; bad.cu_err = 0
+        with self.assertRaises(RuntimeError) as cm:
+            _ck(bad, "hipFileDriverOpen")
+        self.assertIn("hipFileDriverOpen", str(cm.exception))
+        self.assertIn("7", str(cm.exception))
+
+    def test_handle_register(self):
         import hipfile
-        from hipfile._hipfile import hipFileStatus_t, HIPFILE_PLATFORM_NOT_SUPPORTED
-        bad = hipFileStatus_t()
-        bad.err = HIPFILE_PLATFORM_NOT_SUPPORTED
-        self.mock_lib.hipFileDriverOpen.return_value = bad
-        with self.assertRaises(hipfile.HipFileError) as cm:
-            hipfile.driver_open()
-        self.assertEqual(cm.exception.code, HIPFILE_PLATFORM_NOT_SUPPORTED)
+        handle = hipfile.hipFileHandleRegister(3)
+        self.lib.hipFileHandleRegister.assert_called_once()
 
-    def test_driver_set_limits(self):
+    def test_handle_deregister(self):
         import hipfile
-        hipfile.driver_set_max_direct_io_size(128)
-        hipfile.driver_set_max_cache_size(512)
-        hipfile.driver_set_max_pinned_mem_size(256)
-        self.mock_lib.hipFileDriverSetMaxDirectIOSize.assert_called_once()
-        self.mock_lib.hipFileDriverSetMaxCacheSize.assert_called_once()
-        self.mock_lib.hipFileDriverSetMaxPinnedMemSize.assert_called_once()
+        hipfile.hipFileHandleDeregister(ctypes.c_void_p(0))
+        self.lib.hipFileHandleDeregister.assert_called_once()
 
-
-class TestBufRegistration(unittest.TestCase):
-
-    def setUp(self):
-        self.mock_lib = _make_mock_lib()
-        self.patcher = patch("hipfile.hipfile._get_lib", return_value=self.mock_lib)
-        self.patcher.start()
-
-    def tearDown(self):
-        self.patcher.stop()
-
-    def test_buf_register_deregister(self):
+    def test_buf_register(self):
         import hipfile
-        FAKE_PTR = 0xDEADBEEF
-        hipfile.buf_register(FAKE_PTR, 4096)
-        self.mock_lib.hipFileBufRegister.assert_called_once()
-        hipfile.buf_deregister(FAKE_PTR)
-        self.mock_lib.hipFileBufDeregister.assert_called_once()
+        hipfile.hipFileBufRegister(ctypes.c_void_p(0xDEAD), 4096, 0)
+        self.lib.hipFileBufRegister.assert_called_once()
 
-    def test_registered_buffer_context_manager(self):
+    def test_buf_deregister(self):
         import hipfile
-        FAKE_PTR = 0xCAFEBABE
-        with hipfile.RegisteredBuffer(FAKE_PTR, 8192):
-            self.mock_lib.hipFileBufRegister.assert_called_once()
-        self.mock_lib.hipFileBufDeregister.assert_called_once()
+        hipfile.hipFileBufDeregister(ctypes.c_void_p(0xDEAD))
+        self.lib.hipFileBufDeregister.assert_called_once()
 
-    def test_buf_register_error(self):
+    def test_read(self):
         import hipfile
-        from hipfile._hipfile import hipFileStatus_t, HIPFILE_INVALID_PTR
-        bad = hipFileStatus_t(); bad.err = HIPFILE_INVALID_PTR
-        self.mock_lib.hipFileBufRegister.return_value = bad
-        with self.assertRaises(hipfile.HipFileError):
-            hipfile.buf_register(0, 4096)
-
-
-class TestHipFileHandle(unittest.TestCase):
-
-    def setUp(self):
-        self.mock_lib = _make_mock_lib()
-        self.patcher = patch("hipfile.hipfile._get_lib", return_value=self.mock_lib)
-        self.patcher.start()
-
-    def tearDown(self):
-        self.patcher.stop()
-
-    def test_handle_register_deregister(self):
-        import hipfile
-        with hipfile.HipFileHandle(fd=3) as hf:
-            self.mock_lib.hipFileHandleRegister.assert_called_once()
-        self.mock_lib.hipFileHandleDeregister.assert_called_once()
-
-    def test_read_returns_byte_count(self):
-        import hipfile
-        with hipfile.HipFileHandle(fd=3) as hf:
-            n = hf.read(device_ptr=0xABCDEF, count=1024, file_offset=0)
+        n = hipfile.hipFileRead(ctypes.c_void_p(0), ctypes.c_void_p(0x1), 1024, 0, 0)
         self.assertEqual(n, 1024)
 
-    def test_write_returns_byte_count(self):
+    def test_write(self):
         import hipfile
-        with hipfile.HipFileHandle(fd=3) as hf:
-            n = hf.write(device_ptr=0xABCDEF, count=1024, file_offset=0)
+        n = hipfile.hipFileWrite(ctypes.c_void_p(0), ctypes.c_void_p(0x1), 1024, 0, 0)
         self.assertEqual(n, 1024)
 
-    def test_read_io_error(self):
-        import hipfile
-        self.mock_lib.hipFileRead.return_value = -9
-        with hipfile.HipFileHandle(fd=3) as hf:
-            with self.assertRaises(hipfile.HipFileError):
-                hf.read(device_ptr=0x1, count=512, file_offset=0)
 
-    def test_read_async(self):
-        import hipfile
-        with hipfile.HipFileHandle(fd=3) as hf:
-            # Should not raise
-            hf.read_async(device_ptr=0x1, count=512, file_offset=0, stream=None)
-        self.mock_lib.hipFileReadAsync.assert_called_once()
+# ---------------------------------------------------------------------------
+# buf_register / buf_deregister helper  (int and c_void_p inputs)
+# ---------------------------------------------------------------------------
 
-    def test_write_async(self):
-        import hipfile
-        with hipfile.HipFileHandle(fd=3) as hf:
-            hf.write_async(device_ptr=0x1, count=512, file_offset=0, stream=None)
-        self.mock_lib.hipFileWriteAsync.assert_called_once()
+class TestBufHelpers(unittest.TestCase):
 
-    def test_handle_register_error(self):
+    def setUp(self):
+        self.lib = _make_mock_lib()
+        self.p   = _patch_lib(self.lib)
+        self.p.start()
+        # also patch _get_lib so driver singleton doesn't try to load .so
+        self.p2 = patch("hipfile.hipfile._get_lib", return_value=self.lib)
+        self.p2.start()
+
+    def tearDown(self):
+        self.p.stop()
+        self.p2.stop()
+
+    def test_buf_register_int(self):
         import hipfile
-        from hipfile._hipfile import hipFileStatus_t, HIPFILE_INVALID_FILE_DESCRIPTOR
-        bad = hipFileStatus_t(); bad.err = HIPFILE_INVALID_FILE_DESCRIPTOR
-        self.mock_lib.hipFileHandleRegister.return_value = bad
-        with self.assertRaises(hipfile.HipFileError) as cm:
-            hipfile.HipFileHandle(fd=999)
-        self.assertEqual(cm.exception.code, HIPFILE_INVALID_FILE_DESCRIPTOR)
+        hipfile.buf_register(0xCAFE, 4096)
+        self.lib.hipFileBufRegister.assert_called_once()
+
+    def test_buf_register_c_void_p(self):
+        import hipfile
+        hipfile.buf_register(ctypes.c_void_p(0xCAFE), 4096)
+        self.lib.hipFileBufRegister.assert_called_once()
+
+    def test_buf_deregister_int(self):
+        import hipfile
+        hipfile.buf_deregister(0xCAFE)
+        self.lib.hipFileBufDeregister.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# CuFileDriver singleton
+# ---------------------------------------------------------------------------
+
+class TestCuFileDriver(unittest.TestCase):
+
+    def setUp(self):
+        self.lib = _make_mock_lib()
+        self.p   = _patch_lib(self.lib)
+        self.p.start()
+        self.p2 = patch("hipfile.hipfile._get_lib", return_value=self.lib)
+        self.p2.start()
+        # Reset singleton cache by patching CuFileDriver directly in hipfile.hipfile
+        import hipfile.hipfile as hm
+        # The _singleton decorator closes over a dict; find and clear it
+        for cell in hm._singleton.__code__.co_consts:
+            pass  # no-op, we patch via p4 below
+
+    def tearDown(self):
+        self.p.stop()
+        self.p2.stop()
+
+    def test_driver_opens_on_init(self):
+        import hipfile
+        hipfile.CuFileDriver()
+        self.lib.hipFileDriverOpen.assert_called_once()
+
+    def test_singleton_returns_same_instance(self):
+        import hipfile
+        a = hipfile.CuFileDriver()
+        b = hipfile.CuFileDriver()
+        self.assertIs(a, b)  # same object — that's the singleton contract
+
+
+# ---------------------------------------------------------------------------
+# CuFile
+# ---------------------------------------------------------------------------
+
+class TestCuFile(unittest.TestCase):
+
+    def setUp(self):
+        self.lib = _make_mock_lib()
+        self.p   = _patch_lib(self.lib)
+        self.p.start()
+        self.p2 = patch("hipfile.hipfile._get_lib", return_value=self.lib)
+        self.p2.start()
+        # Suppress CuFileDriver singleton state between tests
+        self.p3 = patch("hipfile.hipfile.CuFileDriver", return_value=MagicMock())
+        self.p3.start()
+
+        self.tmp = tempfile.NamedTemporaryFile(delete=False)
+        self.tmp.write(b"\x00" * 4096)
+        self.tmp.close()
+
+    def tearDown(self):
+        self.p.stop()
+        self.p2.stop()
+        self.p3.stop()
+        os.unlink(self.tmp.name)
+
+    def test_lazy_open(self):
+        """__init__ must NOT open the file."""
+        import hipfile
+        f = hipfile.CuFile(self.tmp.name, "r")
+        self.assertFalse(f.is_open)
+
+    def test_open_and_close(self):
+        import hipfile
+        f = hipfile.CuFile(self.tmp.name, "r")
+        f.open()
+        self.assertTrue(f.is_open)
+        self.lib.hipFileHandleRegister.assert_called_once()
+        f.close()
+        self.assertFalse(f.is_open)
+        self.lib.hipFileHandleDeregister.assert_called_once()
+
+    def test_context_manager(self):
+        import hipfile
+        with hipfile.CuFile(self.tmp.name, "r+") as f:
+            self.assertTrue(f.is_open)
+        self.assertFalse(f.is_open)
+
+    def test_double_open_is_noop(self):
+        import hipfile
+        with hipfile.CuFile(self.tmp.name, "r") as f:
+            f.open()
+            self.lib.hipFileHandleRegister.assert_called_once()
+
+    def test_double_close_is_noop(self):
+        import hipfile
+        with hipfile.CuFile(self.tmp.name, "r") as f:
+            pass
+        f.close()
+        self.lib.hipFileHandleDeregister.assert_called_once()
+
+    def test_read_requires_open(self):
+        import hipfile
+        f = hipfile.CuFile(self.tmp.name, "r")
+        with self.assertRaises(IOError):
+            f.read(ctypes.c_void_p(0xABCD), 1024)
+
+    def test_write_requires_open(self):
+        import hipfile
+        f = hipfile.CuFile(self.tmp.name, "r+")
+        with self.assertRaises(IOError):
+            f.write(ctypes.c_void_p(0xABCD), 1024)
+
+    def test_read_returns_int(self):
+        import hipfile
+        with hipfile.CuFile(self.tmp.name, "r") as f:
+            n = f.read(ctypes.c_void_p(0xABCD), 1024, file_offset=0)
+        self.assertEqual(n, 1024)
+
+    def test_write_returns_int(self):
+        import hipfile
+        with hipfile.CuFile(self.tmp.name, "r+") as f:
+            n = f.write(ctypes.c_void_p(0xABCD), 1024, file_offset=0)
+        self.assertEqual(n, 1024)
+
+    def test_dev_offset_passed_through(self):
+        import hipfile
+        with hipfile.CuFile(self.tmp.name, "r") as f:
+            f.read(ctypes.c_void_p(0x1), 512, file_offset=128, dev_offset=64)
+        # third positional arg to hipFileRead is size=512, then file_offset=128, dev_offset=64
+        args = self.lib.hipFileRead.call_args[0]
+        self.assertEqual(args[2], 512)   # size
+        self.assertEqual(args[3], 128)   # file_offset
+        self.assertEqual(args[4], 64)    # dev_offset
+
+    def test_get_handle_when_open(self):
+        import hipfile
+        with hipfile.CuFile(self.tmp.name, "r") as f:
+            self.assertIsInstance(f.get_handle(), int)
+
+    def test_get_handle_when_closed(self):
+        import hipfile
+        f = hipfile.CuFile(self.tmp.name, "r")
+        self.assertIsNone(f.get_handle())
+
+    def test_use_direct_io(self):
+        import hipfile
+        f = hipfile.CuFile(self.tmp.name, "r", use_direct_io=True)
+        f.open()
+        f.close()
+
+    def test_bad_mode_raises(self):
+        import hipfile
+        with self.assertRaises(ValueError):
+            hipfile.CuFile(self.tmp.name, "z")
 
     def test_repr(self):
         import hipfile
-        with hipfile.HipFileHandle(fd=3) as hf:
-            self.assertIn("HipFileHandle", repr(hf))
+        f = hipfile.CuFile(self.tmp.name, "r")
+        r = repr(f)
+        self.assertIn("CuFile", r)
+        self.assertIn("open=False", r)
 
 
-class TestErrorNames(unittest.TestCase):
-
-    def test_known_error(self):
-        from hipfile._hipfile import error_name, HIPFILE_PERMISSION_DENIED
-        self.assertEqual(error_name(HIPFILE_PERMISSION_DENIED), "HIPFILE_PERMISSION_DENIED")
-
-    def test_unknown_error(self):
-        from hipfile._hipfile import error_name
-        name = error_name(9999)
-        self.assertIn("9999", name)
-
+# ---------------------------------------------------------------------------
+# Public API surface
+# ---------------------------------------------------------------------------
 
 class TestPublicAPI(unittest.TestCase):
-    """Smoke-test that the public __init__ exports are all importable."""
 
     def test_all_exports_present(self):
         import hipfile

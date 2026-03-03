@@ -23,8 +23,8 @@ staging buffers.
 
 ```bash
 # From source
-git clone https://github.com/your-fork/hipfile-python
-cd hipfile-python
+git clone https://github.com/ROCm/hipFile.git
+cd hipFile/python
 pip install -e .
 ```
 
@@ -41,9 +41,10 @@ export HIPFILE_LIB_PATH=/opt/rocm/lib/libhipfile.so
 ```python
 import os
 import hipfile
+import ctypes
 
 # --- Open the driver ---
-with hipfile.Driver():
+with hipfile.CuFileDriver():
 
     # Open a file with O_DIRECT for best performance
     fd = os.open("data.bin", os.O_RDONLY | os.O_DIRECT)
@@ -56,10 +57,13 @@ with hipfile.Driver():
         gpu_ptr = tensor.data_ptr()
 
         # Register the GPU buffer, then do the I/O
-        with hipfile.RegisteredBuffer(gpu_ptr, byte_size):
-            with hipfile.HipFileHandle(fd) as hf:
-                n = hf.read(gpu_ptr, count=byte_size, file_offset=0)
+        hipfile.buf_register(gpu_ptr, byte_size)
+        try:
+            with hipfile.CuFile("data.bin", "r") as f:
+                n = f.read(ctypes.c_void_p(gpu_ptr), byte_size, file_offset=0)
                 print(f"Read {n} bytes directly into GPU memory")
+        finally:
+            hipfile.buf_deregister(gpu_ptr)
 
     finally:
         os.close(fd)
@@ -72,44 +76,48 @@ with hipfile.Driver():
 ### Driver lifecycle
 
 ```python
-hipfile.driver_open()            # initialise the hipFile driver
-hipfile.driver_close()           # tear down
+hipfile.hipFileDriverOpen()            # initialise the hipFile driver
+hipfile.hipFileDriverClose()           # tear down
 
-props = hipfile.driver_get_properties()  # returns hipFileDriverProps_t
+props = hipfile.hipFileDriverGetProperties()  # returns hipFileDriverProps_t
 print(props.major_version, props.minor_version)
 
-hipfile.driver_set_max_direct_io_size(128)   # KB
-hipfile.driver_set_max_cache_size(512)       # KB
-hipfile.driver_set_max_pinned_mem_size(256)  # KB
+hipfile.hipFileDriverSetMaxDirectIOSize(128)   # KB
+hipfile.hipFileDriverSetMaxCacheSize(512)       # KB
+hipfile.hipFileDriverSetMaxPinnedMemSize(256)  # KB
 ```
 
 ### Context managers
 
 ```python
-with hipfile.Driver():                          # open / close driver
-    with hipfile.RegisteredBuffer(ptr, size):  # pin / unpin GPU buffer
-        with hipfile.HipFileHandle(fd) as hf:  # register / deregister fd
-            hf.read(ptr, count=size, file_offset=0)
-            hf.write(ptr, count=size, file_offset=0)
+with hipfile.CuFileDriver():                    # open / close driver
+    # Register GPU buffer
+    hipfile.buf_register(ptr, size)
+    try:
+        with hipfile.CuFile("data.bin", "r+") as f:  # open / close file
+            f.read(ptr, count=size, file_offset=0)
+            f.write(ptr, count=size, file_offset=0)
+    finally:
+        hipfile.buf_deregister(ptr)
 ```
 
-### Async (stream-ordered) I/O
+### Buffer registration
 
 ```python
-with hipfile.HipFileHandle(fd) as hf:
-    hf.read_async(ptr, count=size, file_offset=0, stream=hip_stream)
-    hf.write_async(ptr, count=size, file_offset=0, stream=hip_stream)
-    # synchronise the stream before using the data
+# Direct function calls
+hipfile.buf_register(gpu_ptr, size, flags=0)
+hipfile.buf_deregister(gpu_ptr)
+
+# Note: RegisteredBuffer context manager is planned for future release
 ```
 
 ### Error handling
 
 ```python
 try:
-    hipfile.driver_open()
+    hipfile.hipFileDriverOpen()
 except hipfile.HipFileError as e:
-    print(f"Error code: {e.code}, HIP error: {e.hip_err}")
-    print(hipfile.error_name(e.code))
+    print(f"HipFile error occurred")
 ```
 
 ---
@@ -123,12 +131,37 @@ pip install pytest
 pytest tests/ -v
 ```
 
+For LMCache integration testing:
+
+```bash
+python test_lmcache_integration.py
+```
+
 ---
 
 ## PyTorch example
 
 ```bash
 python examples/pytorch_example.py --create --count 1048576
+```
+
+---
+
+## LMCache Integration
+
+hipFile Python bindings are designed to be a drop-in replacement for NVIDIA's cuFile in applications like LMCache:
+
+```python
+# Works with both cuFile and hipFile
+try:
+    import cufile as gds_lib
+except ImportError:
+    import hipfile as gds_lib
+
+# Same API for both
+with gds_lib.CuFileDriver():
+    gds_lib.buf_register(tensor.data_ptr(), tensor.nbytes)
+    # ... perform GDS operations ...
 ```
 
 ---
@@ -143,6 +176,15 @@ needed. The binding layer:
 2. Declares `argtypes` / `restype` for each API function.
 3. Wraps the C types in Pythonic classes with context-manager support.
 4. Translates error status codes to `HipFileError` exceptions.
+5. Provides cuFile-compatible API for easy migration.
+
+---
+
+## Known Limitations
+
+- `RegisteredBuffer` context manager is not yet implemented (use direct `buf_register`/`buf_deregister` calls)
+- Some advanced cuFile features may not yet have hipFile equivalents
+- Error reporting is less detailed than NVIDIA's cuFile
 
 ---
 

@@ -202,6 +202,7 @@ def buf_register(buf, size: int, flags: int = 0) -> None:
 
 def buf_deregister(buf) -> None:
     """Deregister a previously registered GPU buffer."""
+    _get_lib()
     if isinstance(buf, int):
         buf = ctypes.c_void_p(buf)
     hipFileBufDeregister(buf)
